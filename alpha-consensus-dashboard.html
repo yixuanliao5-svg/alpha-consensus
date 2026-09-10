@@ -1,0 +1,1037 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Alpha Consensus — 市場觀點共識盤</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.5/babel.min.js"></script>
+  <style>
+    body { margin: 0; background: #020617; }
+    .vertical-rl { writing-mode: vertical-rl; text-orientation: mixed; }
+    .tab-active { border-bottom: 2px solid #38bdf8; color: #f1f5f9; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useCallback } = React;
+
+    /* ============================================================
+       Alpha Consensus — 市場觀點共識盤
+       對齊 Capafy「Alpha Consensus — X's Top 10 Traders」體驗
+       紅 = 看多，綠 = 看空｜僅公開資訊，不構成投資建議
+       ============================================================ */
+
+    const STORAGE_KEY = "alphaconsensus:state:v2";
+
+    const DEFAULT_ACCOUNTS = [
+      { handle: "unusual_whales", name: "Unusual Whales", focus: "選擇權異常流、國會交易揭露" },
+      { handle: "DeItaone", name: "Walter Bloomberg", focus: "即時新聞快訊" },
+      { handle: "zerohedge", name: "ZeroHedge", focus: "宏觀、資金流、空方偏向" },
+      { handle: "charliebilello", name: "Charlie Bilello", focus: "數據與長期統計" },
+      { handle: "LizAnnSonders", name: "Liz Ann Sonders", focus: "總經與市場廣度" },
+      { handle: "markminervini", name: "Mark Minervini", focus: "動能與相對強度" },
+      { handle: "chamath", name: "Chamath Palihapitiya", focus: "科技與成長股敘事" },
+      { handle: "RampCapitalLLC", name: "Ramp Capital", focus: "盤面情緒" },
+      { handle: "Mr_Derivatives", name: "Mr. Derivatives", focus: "衍生品部位" },
+      { handle: "TheStalwart", name: "Joe Weisenthal", focus: "宏觀敘事" },
+    ];
+
+    const STANCE = {
+      bull: { label: "看多", short: "多", text: "text-red-400", cell: "bg-red-950", ring: "border-red-800", dot: "bg-red-400" },
+      bear: { label: "看空", short: "空", text: "text-emerald-400", cell: "bg-emerald-950", ring: "border-emerald-800", dot: "bg-emerald-400" },
+      neutral: { label: "中性／觀望", short: "平", text: "text-slate-300", cell: "bg-slate-800", ring: "border-slate-700", dot: "bg-slate-400" },
+      unclear: { label: "未表明", short: "—", text: "text-slate-600", cell: "bg-transparent", ring: "border-slate-800", dot: "bg-slate-700" },
+    };
+
+    const EVIDENCE = {
+      catalyst: "催化劑／事件",
+      valuation: "估值／基本面",
+      technical: "技術面",
+      flow: "資金流／部位",
+      disclosed_trade: "已揭露交易",
+      news: "新聞轉述",
+      macro: "總體環境",
+      sentiment: "情緒面",
+    };
+
+    const REPORT_LANGS = [
+      { id: "zh-TW", label: "繁體中文" },
+      { id: "en", label: "English" },
+      { id: "ja", label: "日本語" },
+    ];
+
+    const TIME_RANGES = [
+      { id: "daily", label: "每日", days: 1 },
+      { id: "weekly", label: "每週", days: 7 },
+      { id: "monthly", label: "每月", days: 28 },
+    ];
+
+    /* ---------- Claude helpers ---------- */
+    async function callClaude(messages) {
+      const apiKey = localStorage.getItem("anthropic_api_key") || "";
+      if (!apiKey) throw new Error("尚未設定 Anthropic API Key。請到「設定」貼上 key，或先載入示範資料。");
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1400,
+          messages,
+        }),
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        throw new Error(`模型呼叫失敗（${res.status}）${t ? "：" + t.slice(0, 100) : ""}`);
+      }
+      const data = await res.json();
+      return (data.content || []).map((b) => (b.type === "text" ? b.text : "")).filter(Boolean).join("\n");
+    }
+
+    function extractJson(text) {
+      const cleaned = String(text).replace(/```json/gi, "").replace(/```/g, "").trim();
+      const a = cleaned.indexOf("[");
+      const b = cleaned.lastIndexOf("]");
+      if (a !== -1 && b > a) return JSON.parse(cleaned.slice(a, b + 1));
+      const c = cleaned.indexOf("{");
+      const d = cleaned.lastIndexOf("}");
+      if (c !== -1 && d > c) return JSON.parse(cleaned.slice(c, d + 1));
+      throw new Error("模型回傳的內容無法解析成結構化資料");
+    }
+
+    const PARSE_INSTRUCTION = `你是市場評論的結構化標註器。把輸入的貼文內容轉成 JSON 陣列。
+每個「一位作者對一檔標的的一個立場」是一筆紀錄，欄位如下：
+{"handle":"作者帳號(不含@)","ticker":"股票代號(美股用大寫英文，台股用數字代號)","name":"公司名","stance":"bull|bear|neutral|unclear","conviction":1到5的整數,"evidence":["catalyst|valuation|technical|flow|disclosed_trade|news|macro|sentiment" 可多選],"thesis":"一句話說明他的依據，20字內","quote":"原文中最能代表立場的片段，30字內","date":"YYYY-MM-DD","url":"原文連結或空字串"}
+規則：
+- 只標註有明確個股指涉的內容，純總經無個股時 ticker 填 "MARKET"。
+- 作者若只是轉述新聞、沒有表態，stance 用 "unclear"。
+- 不要推測作者沒說的東西；thesis 必須能在原文找到依據。
+- 只輸出 JSON 陣列，不要任何前後說明或 markdown 標記。`;
+
+    /* ---------- 資料運算 ---------- */
+    function keyOf(s) {
+      return `${s.handle}::${s.ticker}`;
+    }
+
+    function daysAgo(n) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() - n);
+      return d.toISOString().slice(0, 10);
+    }
+
+    function buildMatrix(signals, accounts) {
+      const byKey = new Map();
+      signals.forEach((s) => {
+        const k = keyOf(s);
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push(s);
+      });
+
+      const tickers = new Map();
+      byKey.forEach((list) => {
+        const sorted = [...list].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+        const latest = sorted[sorted.length - 1];
+        const prior = [...sorted].reverse().find((s) => s.stance !== latest.stance && s.stance !== "unclear");
+        const changed = Boolean(prior) && latest.stance !== "unclear";
+        const ticker = latest.ticker;
+        if (!tickers.has(ticker)) tickers.set(ticker, { ticker, name: latest.name || "", cells: {} });
+        tickers.get(ticker).cells[latest.handle] = {
+          ...latest,
+          history: sorted,
+          changed,
+          from: prior ? prior.stance : null,
+        };
+      });
+
+      return [...tickers.values()].map((row) => {
+        const cells = Object.values(row.cells);
+        const bull = cells.filter((c) => c.stance === "bull").length;
+        const bear = cells.filter((c) => c.stance === "bear").length;
+        const neutral = cells.filter((c) => c.stance === "neutral").length;
+        const covered = cells.filter((c) => c.stance !== "unclear").length;
+        const silent = accounts.length - cells.length;
+        const divergence = covered > 0 ? (2 * Math.min(bull, bear)) / covered : 0;
+        const net = bull - bear;
+        const changes = cells.filter((c) => c.changed).length;
+        const lastDate = cells.map((c) => c.date || "").sort().pop() || "";
+        const mentionCount = cells.reduce((sum, c) => sum + (c.history?.length || 1), 0);
+        return { ...row, bull, bear, neutral, covered, silent, divergence, net, changes, lastDate, mentionCount };
+      });
+    }
+
+    /* ---------- 小元件 ---------- */
+    function StanceCell({ cell, onClick }) {
+      if (!cell) {
+        return (
+          <td className="border border-slate-800 p-0">
+            <div className="h-9 w-full flex items-center justify-center text-slate-700 text-xs">·</div>
+          </td>
+        );
+      }
+      const st = STANCE[cell.stance] || STANCE.unclear;
+      return (
+        <td className="border border-slate-800 p-0">
+          <button
+            onClick={onClick}
+            title={`${cell.thesis || ""}${cell.changed ? `（由${STANCE[cell.from]?.label || ""}轉向）` : ""}`}
+            className={`h-9 w-full flex items-center justify-center gap-1 ${st.cell} hover:brightness-150 focus:outline-none focus:ring-2 focus:ring-sky-400 transition-[filter]`}
+          >
+            <span className={`text-xs font-semibold ${st.text}`}>{st.short}</span>
+            <span className="flex gap-0.5 items-end">
+              {[1, 2, 3].map((i) => (
+                <span
+                  key={i}
+                  className={`w-0.5 rounded-sm ${i <= Math.ceil((cell.conviction || 1) * 0.6) ? st.dot : "bg-slate-700"}`}
+                  style={{ height: `${3 + i * 2}px` }}
+                />
+              ))}
+            </span>
+            {cell.changed && <span className="w-1.5 h-1.5 rounded-full bg-violet-400" />}
+          </button>
+        </td>
+      );
+    }
+
+    function Bar({ bull, bear, neutral }) {
+      const total = Math.max(1, bull + bear + neutral);
+      return (
+        <div className="flex h-1.5 w-20 rounded-sm overflow-hidden bg-slate-800">
+          <div className="bg-red-500" style={{ width: `${(bull / total) * 100}%` }} />
+          <div className="bg-slate-600" style={{ width: `${(neutral / total) * 100}%` }} />
+          <div className="bg-emerald-500" style={{ width: `${(bear / total) * 100}%` }} />
+        </div>
+      );
+    }
+
+    function Modal({ title, children, onClose }) {
+      return (
+        <div className="fixed inset-0 z-30 flex items-start justify-center bg-slate-950 bg-opacity-80 p-4 overflow-y-auto" onClick={onClose}>
+          <div className="mt-10 w-full max-w-2xl rounded-lg border border-slate-700 bg-slate-900 p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-slate-50">{title}</h2>
+              <button onClick={onClose} className="text-slate-500 hover:text-slate-200 text-sm">關閉</button>
+            </div>
+            <div className="mt-4">{children}</div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ---------- 主元件 ---------- */
+    function ConsensusDashboard() {
+      const [accounts, setAccounts] = useState(DEFAULT_ACCOUNTS);
+      const [signals, setSignals] = useState([]);
+      const [loaded, setLoaded] = useState(false);
+      const [sortBy, setSortBy] = useState("divergence");
+      const [timeRange, setTimeRange] = useState("daily");
+      const [mainTab, setMainTab] = useState("dashboard"); // dashboard | accounts | qa
+      const [openTicker, setOpenTicker] = useState(null);
+      const [panel, setPanel] = useState(null);
+      const [busy, setBusy] = useState("");
+      const [error, setError] = useState("");
+      const [pasted, setPasted] = useState("");
+      const [reportLang, setReportLang] = useState("zh-TW");
+      const [report, setReport] = useState("");
+      const [analysis, setAnalysis] = useState({});
+      const [apiKeyInput, setApiKeyInput] = useState("");
+      const [qaQuestion, setQaQuestion] = useState("");
+      const [qaAnswer, setQaAnswer] = useState("");
+      const [dataCutoff, setDataCutoff] = useState("");
+
+      useEffect(() => {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed.accounts?.length) setAccounts(parsed.accounts);
+            if (parsed.signals?.length) setSignals(parsed.signals);
+            if (parsed.dataCutoff) setDataCutoff(parsed.dataCutoff);
+          }
+          const key = localStorage.getItem("anthropic_api_key");
+          if (key) setApiKeyInput(key);
+        } catch (e) {}
+        finally { setLoaded(true); }
+      }, []);
+
+      const persist = useCallback((nextAccounts, nextSignals, cutoff) => {
+        try {
+          const cut = cutoff || dataCutoff || new Date().toISOString();
+          localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            accounts: nextAccounts,
+            signals: nextSignals,
+            dataCutoff: cut,
+          }));
+          if (cutoff) setDataCutoff(cutoff);
+        } catch (e) {
+          setError("資料存檔失敗，這次的變更只留在畫面上。");
+        }
+      }, [dataCutoff]);
+
+      const addSignals = useCallback((incoming) => {
+        const clean = incoming
+          .filter((s) => s && s.handle && s.ticker)
+          .map((s) => ({
+            id: `${s.handle}-${s.ticker}-${s.date || ""}-${(s.quote || "").slice(0, 12)}`,
+            handle: String(s.handle).replace("@", ""),
+            ticker: String(s.ticker).toUpperCase(),
+            name: s.name || "",
+            stance: STANCE[s.stance] ? s.stance : "unclear",
+            conviction: Number(s.conviction) || 3,
+            evidence: Array.isArray(s.evidence) ? s.evidence : [],
+            thesis: s.thesis || "",
+            quote: s.quote || "",
+            date: s.date || new Date().toISOString().slice(0, 10),
+            url: s.url || "",
+          }));
+        setSignals((prev) => {
+          const seen = new Set(prev.map((p) => p.id));
+          const merged = [...prev, ...clean.filter((c) => !seen.has(c.id))];
+          const cutoff = new Date().toISOString();
+          persist(accounts, merged, cutoff);
+          return merged;
+        });
+        return clean.length;
+      }, [accounts, persist]);
+
+      const filteredSignals = useMemo(() => {
+        const range = TIME_RANGES.find((t) => t.id === timeRange) || TIME_RANGES[0];
+        const since = daysAgo(range.days - 1);
+        // daily: if too few, include previous day (as Capafy does)
+        if (timeRange === "daily") {
+          const today = daysAgo(0);
+          const todayCount = signals.filter((s) => (s.date || "") >= today).length;
+          if (todayCount < 3) {
+            const yesterday = daysAgo(1);
+            return signals.filter((s) => (s.date || "") >= yesterday);
+          }
+          return signals.filter((s) => (s.date || "") >= today);
+        }
+        return signals.filter((s) => (s.date || "") >= since);
+      }, [signals, timeRange]);
+
+      const matrix = useMemo(() => {
+        const rows = buildMatrix(filteredSignals, accounts);
+        const sorters = {
+          divergence: (a, b) => b.divergence - a.divergence || b.covered - a.covered,
+          coverage: (a, b) => b.covered - a.covered,
+          net: (a, b) => b.net - a.net,
+          recent: (a, b) => (b.lastDate || "").localeCompare(a.lastDate || ""),
+          mentions: (a, b) => b.mentionCount - a.mentionCount,
+        };
+        return rows.sort(sorters[sortBy] || sorters.divergence);
+      }, [filteredSignals, accounts, sortBy]);
+
+      const activeAccounts = useMemo(() => {
+        const counts = {};
+        filteredSignals.forEach((s) => {
+          counts[s.handle] = counts[s.handle] || { bull: 0, bear: 0, neutral: 0, total: 0 };
+          if (counts[s.handle][s.stance] !== undefined) counts[s.handle][s.stance] += 1;
+          counts[s.handle].total += 1;
+        });
+        return accounts.map((a) => ({ ...a, stats: counts[a.handle] || { bull: 0, bear: 0, neutral: 0, total: 0 } }));
+      }, [accounts, filteredSignals]);
+
+      const summaryStats = useMemo(() => {
+        const totalBull = matrix.reduce((s, r) => s + r.bull, 0);
+        const totalBear = matrix.reduce((s, r) => s + r.bear, 0);
+        const highDiv = matrix.filter((r) => r.divergence >= 0.6).length;
+        const changed = matrix.filter((r) => r.changes > 0).length;
+        return { totalBull, totalBear, highDiv, changed, tickers: matrix.length };
+      }, [matrix]);
+
+      async function ingestPasted() {
+        if (!pasted.trim()) return;
+        setBusy("正在讀取貼文並標註立場…");
+        setError("");
+        try {
+          const out = await callClaude([{
+            role: "user",
+            content: `${PARSE_INSTRUCTION}\n\n追蹤名單（handle）：${accounts.map((a) => a.handle).join(", ")}\n今天日期：${new Date().toISOString().slice(0, 10)}\n\n以下是貼文原文：\n"""\n${pasted.slice(0, 12000)}\n"""`,
+          }]);
+          const rows = extractJson(out);
+          const n = addSignals(rows);
+          setPasted("");
+          setBusy("");
+          if (n === 0) setError("這批內容裡沒有可辨識的個股立場。");
+          else setPanel(null);
+        } catch (e) {
+          setBusy("");
+          setError(e.message || "標註失敗");
+        }
+      }
+
+      async function makeReport() {
+        setBusy("正在整理共識摘要…");
+        setError("");
+        try {
+          const rows = matrix.slice(0, 15).map((r) => ({
+            ticker: r.ticker,
+            bull: r.bull,
+            bear: r.bear,
+            neutral: r.neutral,
+            silent: r.silent,
+            changes: r.changes,
+            divergence: Math.round(r.divergence * 100) / 100,
+            views: Object.values(r.cells).map((c) => ({ handle: c.handle, stance: c.stance, thesis: c.thesis })),
+          }));
+          const rangeLabel = TIME_RANGES.find((t) => t.id === timeRange)?.label || "每日";
+          const langLabel = REPORT_LANGS.find((l) => l.id === reportLang)?.label;
+          const out = await callClaude([{
+            role: "user",
+            content: `以下是追蹤帳號在「${rangeLabel}」視角的個股立場統計（JSON）。用${langLabel}寫一份市場共識摘要，350 字內，結構為：一、共識最集中的標的；二、分歧最大的標的與雙方依據差異；三、立場出現轉向的地方。只陳述資料裡有的東西，不要加入預測或投資建議，也不要用 markdown 標題符號。\n\n${JSON.stringify(rows)}`,
+          }]);
+          setReport(out);
+          setBusy("");
+        } catch (e) {
+          setBusy("");
+          setError(e.message || "摘要產生失敗");
+        }
+      }
+
+      async function analyzeTicker(ticker) {
+        setBusy("正在比對各方依據…");
+        try {
+          const row = matrix.find((r) => r.ticker === ticker);
+          const views = Object.values(row.cells).map((c) => ({
+            handle: c.handle, stance: c.stance, evidence: c.evidence,
+            thesis: c.thesis, quote: c.quote, date: c.date,
+            history: (c.history || []).map((h) => ({ date: h.date, stance: h.stance })),
+          }));
+          const out = await callClaude([{
+            role: "user",
+            content: `這是多位評論者對 ${ticker} 的公開立場。請用繁體中文寫 180 字內的比較，涵蓋三個時間面向：1) 目前觀點 2) 近期變化 3) 歷史背景中可檢驗的主張。只根據給定內容，不要延伸推論，不要給投資建議。\n\n${JSON.stringify(views)}`,
+          }]);
+          setAnalysis((prev) => ({ ...prev, [ticker]: out }));
+          setBusy("");
+        } catch (e) {
+          setBusy("");
+          setError(e.message || "比對失敗");
+        }
+      }
+
+      async function askQA() {
+        if (!qaQuestion.trim()) return;
+        setBusy("正在分析…");
+        setQaAnswer("");
+        setError("");
+        try {
+          const context = matrix.slice(0, 20).map((r) => ({
+            ticker: r.ticker,
+            bull: r.bull, bear: r.bear, neutral: r.neutral,
+            views: Object.values(r.cells).map((c) => ({
+              handle: c.handle, stance: c.stance, thesis: c.thesis, date: c.date,
+            })),
+          }));
+          const out = await callClaude([{
+            role: "user",
+            content: `你是市場觀點彙整助手。以下是目前追蹤的 10 個帳號對各股票的公開立場資料（JSON）。請用繁體中文回答使用者問題，優先比較不同帳號的觀點差異，不要把沒提過該股票的帳號當成中立，不要給投資建議。\n\n資料：\n${JSON.stringify(context)}\n\n使用者問題：${qaQuestion}`,
+          }]);
+          setQaAnswer(out);
+          setBusy("");
+        } catch (e) {
+          setBusy("");
+          setError(e.message || "問答失敗");
+        }
+      }
+
+      function loadDemo() {
+        const today = new Date();
+        const d = (n) => new Date(today.getTime() - n * 86400000).toISOString().slice(0, 10);
+        const demo = [
+          { handle: "unusual_whales", ticker: "NVDA", name: "NVIDIA", stance: "bull", conviction: 4, evidence: ["flow", "disclosed_trade"], thesis: "大額買權流入集中在近月", quote: "unusual call flow", date: d(0) },
+          { handle: "zerohedge", ticker: "NVDA", name: "NVIDIA", stance: "bear", conviction: 4, evidence: ["valuation", "macro"], thesis: "資本支出循環見頂風險", quote: "capex peak", date: d(0) },
+          { handle: "markminervini", ticker: "NVDA", name: "NVIDIA", stance: "bull", conviction: 5, evidence: ["technical"], thesis: "重回關鍵均線且量能回補", quote: "base breakout", date: d(1) },
+          { handle: "charliebilello", ticker: "NVDA", name: "NVIDIA", stance: "neutral", conviction: 2, evidence: ["valuation"], thesis: "本益比高於五年均值", quote: "above 5y average", date: d(2) },
+          { handle: "LizAnnSonders", ticker: "SPY", name: "S&P 500 ETF", stance: "bear", conviction: 3, evidence: ["macro"], thesis: "市場廣度持續收斂", quote: "narrowing breadth", date: d(0) },
+          { handle: "TheStalwart", ticker: "SPY", name: "S&P 500 ETF", stance: "neutral", conviction: 2, evidence: ["macro"], thesis: "等待通膨數據確認", quote: "waiting on CPI", date: d(1) },
+          { handle: "chamath", ticker: "TSLA", name: "Tesla", stance: "bull", conviction: 4, evidence: ["catalyst"], thesis: "自駕授權模式重估", quote: "licensing", date: d(1) },
+          { handle: "zerohedge", ticker: "TSLA", name: "Tesla", stance: "bear", conviction: 3, evidence: ["news"], thesis: "交車數低於預期", quote: "deliveries miss", date: d(3) },
+          { handle: "zerohedge", ticker: "TSLA", name: "Tesla", stance: "neutral", conviction: 2, evidence: ["news"], thesis: "價格戰壓力緩解", quote: "price war easing", date: d(0) },
+          { handle: "RampCapitalLLC", ticker: "TSLA", name: "Tesla", stance: "unclear", conviction: 1, evidence: ["sentiment"], thesis: "只轉述盤面反應", quote: "wild tape", date: d(0) },
+          { handle: "Mr_Derivatives", ticker: "AAPL", name: "Apple", stance: "bull", conviction: 3, evidence: ["flow"], thesis: "賣權未平倉異常下降", quote: "put unwind", date: d(1) },
+          { handle: "DeItaone", ticker: "AAPL", name: "Apple", stance: "unclear", conviction: 1, evidence: ["news"], thesis: "轉述供應鏈報導", quote: "supplier report", date: d(0) },
+          { handle: "charliebilello", ticker: "AAPL", name: "Apple", stance: "bull", conviction: 3, evidence: ["valuation"], thesis: "自由現金流殖利率回到中位", quote: "fcf yield", date: d(2) },
+          { handle: "unusual_whales", ticker: "META", name: "Meta", stance: "bull", conviction: 3, evidence: ["flow"], thesis: "近月買權偏多", quote: "call heavy", date: d(0) },
+          { handle: "markminervini", ticker: "META", name: "Meta", stance: "bull", conviction: 4, evidence: ["technical"], thesis: "突破盤整區間", quote: "breakout", date: d(1) },
+          { handle: "zerohedge", ticker: "AMD", name: "AMD", stance: "bear", conviction: 3, evidence: ["valuation"], thesis: "估值相對同業偏高", quote: "rich vs peers", date: d(2) },
+          { handle: "chamath", ticker: "PLTR", name: "Palantir", stance: "bull", conviction: 5, evidence: ["catalyst"], thesis: "政府合約與商業化加速", quote: "gov + commercial", date: d(0) },
+        ];
+        addSignals(demo);
+        setPanel(null);
+        setMainTab("dashboard");
+      }
+
+      function clearAll() {
+        setSignals([]);
+        setAnalysis({});
+        setReport("");
+        setQaAnswer("");
+        persist(accounts, [], new Date().toISOString());
+      }
+
+      function saveApiKey() {
+        const k = apiKeyInput.trim();
+        if (k) localStorage.setItem("anthropic_api_key", k);
+        else localStorage.removeItem("anthropic_api_key");
+        setPanel(null);
+      }
+
+      const openRow = openTicker ? matrix.find((r) => r.ticker === openTicker) : null;
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const cutoffDisplay = dataCutoff
+        ? new Date(dataCutoff).toLocaleString("zh-TW", { hour12: false })
+        : "—";
+
+      if (!loaded) {
+        return (
+          <div className="min-h-screen bg-slate-950 text-slate-500 flex items-center justify-center text-sm">
+            載入中…
+          </div>
+        );
+      }
+
+      return (
+        <div className="min-h-screen bg-slate-950 text-slate-200">
+          {/* 頂部品牌列 */}
+          <header className="border-b border-slate-800 px-5 py-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2">
+                <span className="text-sky-400 text-lg">📡</span>
+                <h1 className="text-lg font-semibold tracking-tight text-slate-50">Alpha Consensus</h1>
+                <span className="hidden sm:inline text-xs text-slate-500">X's Top 10 Traders</span>
+              </div>
+              <span className="font-mono text-xs text-slate-500">{todayStr}</span>
+              <div className="ml-auto flex flex-wrap gap-2">
+                <button onClick={() => setPanel("ingest")} className="rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500">
+                  匯入貼文
+                </button>
+                <button onClick={() => { setPanel("report"); setReport(""); }} className="rounded border border-slate-700 px-3 py-1.5 text-sm hover:bg-slate-800">
+                  產生摘要
+                </button>
+                <button onClick={() => setPanel("settings")} className="rounded border border-slate-700 px-3 py-1.5 text-sm hover:bg-slate-800">
+                  設定
+                </button>
+              </div>
+            </div>
+            <p className="mt-1.5 text-xs text-slate-600">
+              紅＝看多 · 綠＝看空 · 紫點＝立場轉向 · 僅整理公開發言，不構成投資建議
+            </p>
+          </header>
+
+          {/* 主分頁 + 時間範圍 */}
+          <div className="border-b border-slate-800 px-5 flex flex-wrap items-center gap-4 text-sm">
+            <nav className="flex gap-4">
+              {[
+                ["dashboard", "共識儀表板"],
+                ["accounts", "追蹤帳號"],
+                ["qa", "AI 個股問答"],
+              ].map(([id, label]) => (
+                <button
+                  key={id}
+                  onClick={() => setMainTab(id)}
+                  className={`py-3 ${mainTab === id ? "tab-active text-slate-100" : "text-slate-500 hover:text-slate-300"}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
+            {mainTab === "dashboard" && (
+              <div className="flex items-center gap-1 ml-auto py-2">
+                {TIME_RANGES.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => setTimeRange(t.id)}
+                    className={`rounded px-2.5 py-1 text-xs ${timeRange === t.id ? "bg-slate-700 text-slate-100" : "text-slate-500 hover:bg-slate-900"}`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 狀態列 */}
+          <div className="px-5 py-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500 border-b border-slate-900 bg-slate-950/80">
+            <span>{accounts.length} 個追蹤帳號</span>
+            <span>{summaryStats.tickers} 檔標的</span>
+            <span>{filteredSignals.length} 筆立場（{TIME_RANGES.find(t => t.id === timeRange)?.label}）</span>
+            <span className="text-red-400/80">看多 {summaryStats.totalBull}</span>
+            <span className="text-emerald-400/80">看空 {summaryStats.totalBear}</span>
+            {summaryStats.highDiv > 0 && <span className="text-amber-400/80">高分歧 {summaryStats.highDiv}</span>}
+            {summaryStats.changed > 0 && <span className="text-violet-400/80">轉向 {summaryStats.changed}</span>}
+            <span className="ml-auto font-mono">資料截止：{cutoffDisplay}</span>
+          </div>
+
+          {(busy || error) && (
+            <div className={`px-5 py-2 text-sm ${error ? "bg-amber-950 text-amber-300" : "bg-slate-900 text-slate-400"}`}>
+              {error || busy}
+              {error && (
+                <button onClick={() => setError("")} className="ml-3 underline hover:text-amber-100">關閉</button>
+              )}
+            </div>
+          )}
+
+          {/* ===== 共識儀表板 ===== */}
+          {mainTab === "dashboard" && (
+            <div className="flex flex-col lg:flex-row">
+              <aside className="lg:w-56 shrink-0 border-b lg:border-b-0 lg:border-r border-slate-800 p-4">
+                <h2 className="text-sm font-medium text-slate-300">追蹤中</h2>
+                <ul className="mt-3 space-y-2">
+                  {activeAccounts.map((a) => (
+                    <li key={a.handle} className="text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono text-slate-300 truncate">@{a.handle}</span>
+                        <span className="text-slate-600">{a.stats.total}</span>
+                      </div>
+                      <div className="mt-1 flex items-center gap-2">
+                        <Bar bull={a.stats.bull} bear={a.stats.bear} neutral={a.stats.neutral} />
+                        <span className="text-slate-600 truncate">{a.focus}</span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </aside>
+
+              <main className="flex-1 p-4 overflow-x-auto">
+                {matrix.length === 0 ? (
+                  <div className="mx-auto max-w-lg py-16 text-center">
+                    <p className="text-slate-300 text-lg">還沒有任何立場紀錄</p>
+                    <p className="mt-2 text-sm text-slate-500">
+                      從 X 複製追蹤帳號的貼文，貼進「匯入貼文」，系統會拆出標的、立場與依據，排成共識矩陣。也可先載入示範資料體驗完整介面。
+                    </p>
+                    <div className="mt-6 flex justify-center gap-3">
+                      <button onClick={() => setPanel("ingest")} className="rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500">
+                        貼上貼文
+                      </button>
+                      <button onClick={loadDemo} className="rounded border border-slate-700 px-4 py-2 text-sm hover:bg-slate-800">
+                        載入示範資料
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
+                      <span className="text-slate-500">排序</span>
+                      {[
+                        ["divergence", "分歧程度"],
+                        ["coverage", "談論人數"],
+                        ["net", "淨看多"],
+                        ["mentions", "提及次數"],
+                        ["recent", "最新發言"],
+                      ].map(([id, label]) => (
+                        <button
+                          key={id}
+                          onClick={() => setSortBy(id)}
+                          className={`rounded px-2 py-1 ${sortBy === id ? "bg-slate-700 text-slate-100" : "text-slate-500 hover:bg-slate-900"}`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                      <button onClick={clearAll} className="ml-auto text-slate-600 hover:text-rose-400">清空資料</button>
+                    </div>
+
+                    <table className="w-full border-collapse text-sm">
+                      <thead>
+                        <tr>
+                          <th className="sticky left-0 bg-slate-950 border border-slate-800 px-2 py-2 text-left font-medium text-slate-400">標的</th>
+                          {accounts.map((a) => (
+                            <th key={a.handle} className="border border-slate-800 px-1 py-2 align-bottom">
+                              <div className="mx-auto font-mono text-xs text-slate-500 vertical-rl" style={{ maxHeight: "6.5rem" }}>
+                                {a.handle}
+                              </div>
+                            </th>
+                          ))}
+                          <th className="border border-slate-800 px-2 py-2 font-medium text-slate-400">分布</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {matrix.map((row) => (
+                          <tr key={row.ticker} className="hover:bg-slate-900/80">
+                            <td className="sticky left-0 bg-slate-950 border border-slate-800 px-2 py-1">
+                              <button onClick={() => setOpenTicker(row.ticker)} className="text-left focus:outline-none focus:underline">
+                                <span className="font-mono font-semibold text-slate-100">{row.ticker}</span>
+                                {row.divergence >= 0.6 && <span className="ml-2 text-xs text-amber-400">分歧</span>}
+                                {row.changes > 0 && <span className="ml-2 text-xs text-violet-400">轉向 {row.changes}</span>}
+                                <div className="text-xs text-slate-600">{row.name || `${row.covered} 人表態 · ${row.silent} 人未談`}</div>
+                              </button>
+                            </td>
+                            {accounts.map((a) => (
+                              <StanceCell key={a.handle} cell={row.cells[a.handle]} onClick={() => setOpenTicker(row.ticker)} />
+                            ))}
+                            <td className="border border-slate-800 px-2">
+                              <div className="flex items-center gap-2">
+                                <Bar bull={row.bull} bear={row.bear} neutral={row.neutral} />
+                                <span className={`font-mono text-xs ${row.net > 0 ? "text-red-400" : row.net < 0 ? "text-emerald-400" : "text-slate-500"}`}>
+                                  {row.net > 0 ? `+${row.net}` : row.net}
+                                </span>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
+                )}
+              </main>
+            </div>
+          )}
+
+          {/* ===== 追蹤帳號 ===== */}
+          {mainTab === "accounts" && (
+            <div className="p-4 sm:p-5 max-w-3xl mx-auto">
+              <h2 className="text-base font-medium text-slate-200 mb-1">管理 X 追蹤帳號</h2>
+              <p className="text-sm text-slate-400 mb-4">
+                新增你想追蹤的 X 帳號（不用加 @）。改動會即時反映在共識矩陣欄位，並自動存到本機。
+              </p>
+
+              {/* 快速新增表單 */}
+              <div className="rounded-lg border border-slate-700 bg-slate-900/60 p-4 mb-5">
+                <p className="text-xs text-slate-500 mb-2">新增追蹤帳號</p>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <div className="flex-1 flex items-center gap-1 rounded border border-slate-700 bg-slate-950 px-2">
+                    <span className="text-slate-500 font-mono text-sm">@</span>
+                    <input
+                      id="new-handle"
+                      type="text"
+                      placeholder="例如：jimcramer 或 serenity"
+                      className="flex-1 bg-transparent py-2.5 font-mono text-sm text-slate-200 placeholder-slate-600 focus:outline-none"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          const el = document.getElementById("new-handle");
+                          const focusEl = document.getElementById("new-focus");
+                          const h = (el?.value || "").replace(/^@/, "").trim();
+                          if (!h) return;
+                          if (accounts.some((a) => a.handle.toLowerCase() === h.toLowerCase())) {
+                            setError("這個帳號已在追蹤名單中");
+                            return;
+                          }
+                          const next = [...accounts, { handle: h, name: h, focus: (focusEl?.value || "").trim() }];
+                          setAccounts(next);
+                          persist(next, signals);
+                          if (el) el.value = "";
+                          if (focusEl) focusEl.value = "";
+                          setError("");
+                        }
+                      }}
+                    />
+                  </div>
+                  <input
+                    id="new-focus"
+                    type="text"
+                    placeholder="關注領域（可選）例如：動能、選擇權"
+                    className="flex-1 rounded border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-400"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        document.getElementById("btn-add-account")?.click();
+                      }
+                    }}
+                  />
+                  <button
+                    id="btn-add-account"
+                    onClick={() => {
+                      const el = document.getElementById("new-handle");
+                      const focusEl = document.getElementById("new-focus");
+                      const h = (el?.value || "").replace(/^@/, "").trim();
+                      if (!h) {
+                        setError("請輸入 X 帳號（handle）");
+                        return;
+                      }
+                      if (accounts.some((a) => a.handle.toLowerCase() === h.toLowerCase())) {
+                        setError("這個帳號已在追蹤名單中");
+                        return;
+                      }
+                      const next = [...accounts, { handle: h, name: h, focus: (focusEl?.value || "").trim() }];
+                      setAccounts(next);
+                      persist(next, signals);
+                      if (el) el.value = "";
+                      if (focusEl) focusEl.value = "";
+                      setError("");
+                    }}
+                    className="rounded bg-sky-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-sky-500 shrink-0"
+                  >
+                    ＋ 新增
+                  </button>
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-500 mb-2">目前追蹤 {accounts.length} 個帳號</p>
+              <ul className="space-y-2">
+                {accounts.map((a, i) => (
+                  <li key={i} className="flex flex-col sm:flex-row flex-wrap gap-2 items-stretch sm:items-center rounded border border-slate-800 bg-slate-900/40 p-2.5">
+                    <div className="flex items-center gap-1 flex-1 min-w-0">
+                      <span className="text-slate-500 font-mono text-sm shrink-0">@</span>
+                      <input
+                        value={a.handle}
+                        onChange={(e) => {
+                          const next = accounts.map((x, j) => (j === i ? { ...x, handle: e.target.value.replace("@", "") } : x));
+                          setAccounts(next);
+                          persist(next, signals);
+                        }}
+                        className="flex-1 min-w-0 rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-sky-400"
+                        placeholder="handle"
+                      />
+                    </div>
+                    <input
+                      value={a.focus}
+                      onChange={(e) => {
+                        const next = accounts.map((x, j) => (j === i ? { ...x, focus: e.target.value } : x));
+                        setAccounts(next);
+                        persist(next, signals);
+                      }}
+                      className="flex-1 min-w-0 rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400"
+                      placeholder="關注領域"
+                    />
+                    <button
+                      onClick={() => {
+                        const next = accounts.filter((_, j) => j !== i);
+                        setAccounts(next);
+                        persist(next, signals);
+                      }}
+                      className="text-sm text-slate-500 hover:text-rose-400 px-3 py-2 sm:py-0 shrink-0 text-left sm:text-center"
+                    >
+                      移除
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {accounts.length === 0 && (
+                <p className="mt-4 text-sm text-slate-500">名單是空的，請在上方新增至少一個 X 帳號。</p>
+              )}
+            </div>
+          )}
+
+          {/* ===== AI 個股問答 ===== */}
+          {mainTab === "qa" && (
+            <div className="p-5 max-w-2xl mx-auto">
+              <p className="text-sm text-slate-400 mb-4">
+                直接詢問受追蹤股票，例如：「這 10 個帳號對 NVDA 有哪些共識與分歧？」「誰看多 TSLA？理由是什麼？」回答會優先比較不同帳號觀點。需設定 API Key。
+              </p>
+              <div className="flex gap-2">
+                <input
+                  value={qaQuestion}
+                  onChange={(e) => setQaQuestion(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && askQA()}
+                  placeholder="輸入你的問題…"
+                  className="flex-1 rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-400"
+                />
+                <button
+                  onClick={askQA}
+                  disabled={!!busy || !qaQuestion.trim()}
+                  className="rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                >
+                  提問
+                </button>
+              </div>
+              {qaAnswer && (
+                <div className="mt-4 rounded border border-slate-800 bg-slate-900/50 p-4">
+                  <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-200">{qaAnswer}</p>
+                </div>
+              )}
+              {!qaAnswer && !busy && (
+                <div className="mt-6 text-xs text-slate-600 space-y-1">
+                  <p>範例問題：</p>
+                  <ul className="list-disc list-inside space-y-0.5">
+                    <li>這 10 個帳號對 NVDA 有哪些共識與分歧？</li>
+                    <li>誰看多這檔股票？他們的理由是什麼？</li>
+                    <li>最近大家對 TSLA 的看法有什麼變化？</li>
+                    <li>目前這檔股票主要有哪些風險敘事？</li>
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ===== 個股詳情側欄 ===== */}
+          {openRow && (
+            <div className="fixed inset-0 z-20 flex justify-end bg-slate-950 bg-opacity-70" onClick={() => setOpenTicker(null)}>
+              <div className="h-full w-full max-w-md overflow-y-auto border-l border-slate-800 bg-slate-900 p-5" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-start justify-between">
+                  <div>
+                    <h2 className="font-mono text-2xl font-semibold text-slate-50">{openRow.ticker}</h2>
+                    <p className="text-sm text-slate-500">{openRow.name}</p>
+                  </div>
+                  <button onClick={() => setOpenTicker(null)} className="text-slate-500 hover:text-slate-200 text-sm">關閉</button>
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-4 text-sm">
+                  <span className="text-red-400">看多 {openRow.bull}</span>
+                  <span className="text-emerald-400">看空 {openRow.bear}</span>
+                  <span className="text-slate-400">中性 {openRow.neutral}</span>
+                  <span className="text-slate-600">未談 {openRow.silent}</span>
+                </div>
+
+                {["bull", "bear", "neutral", "unclear"].map((st) => {
+                  const group = Object.values(openRow.cells).filter((c) => c.stance === st);
+                  if (!group.length) return null;
+                  return (
+                    <section key={st} className="mt-5">
+                      <h3 className={`text-sm font-medium ${STANCE[st].text}`}>{STANCE[st].label}</h3>
+                      <ul className="mt-2 space-y-3">
+                        {group.map((c) => (
+                          <li key={c.handle} className={`border-l-2 pl-3 ${STANCE[st].ring}`}>
+                            <div className="flex items-baseline gap-2 flex-wrap">
+                              <span className="font-mono text-xs text-slate-300">@{c.handle}</span>
+                              <span className="font-mono text-xs text-slate-600">{c.date}</span>
+                              {c.changed && (
+                                <span className="text-xs text-violet-400">由{STANCE[c.from]?.label}轉向</span>
+                              )}
+                            </div>
+                            <p className="mt-1 text-sm text-slate-200">{c.thesis}</p>
+                            {c.quote && <p className="mt-1 text-xs text-slate-500">「{c.quote}」</p>}
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {(c.evidence || []).map((e) => (
+                                <span key={e} className="rounded bg-slate-800 px-1.5 py-0.5 text-xs text-slate-400">
+                                  {EVIDENCE[e] || e}
+                                </span>
+                              ))}
+                            </div>
+                            {c.history.length > 1 && (
+                              <div className="mt-1 flex flex-wrap gap-1 text-xs text-slate-600">
+                                {c.history.map((h, i) => (
+                                  <span key={i} className={STANCE[h.stance].text}>
+                                    {h.date.slice(5)} {STANCE[h.stance].short}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  );
+                })}
+
+                <section className="mt-6 border-t border-slate-800 pt-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-medium text-slate-300">分歧點比對</h3>
+                    <button onClick={() => analyzeTicker(openRow.ticker)} className="rounded border border-slate-700 px-2 py-1 text-xs hover:bg-slate-800">
+                      {analysis[openRow.ticker] ? "重新比對" : "比對依據"}
+                    </button>
+                  </div>
+                  {analysis[openRow.ticker] ? (
+                    <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-slate-300">
+                      {analysis[openRow.ticker]}
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-xs text-slate-600">
+                      涵蓋目前觀點、近期變化與歷史背景中可檢驗的主張。需 API Key。
+                    </p>
+                  )}
+                </section>
+              </div>
+            </div>
+          )}
+
+          {/* 匯入 */}
+          {panel === "ingest" && (
+            <Modal title="匯入貼文" onClose={() => setPanel(null)}>
+              <p className="text-sm text-slate-400">
+                從 X 複製貼文貼在下方，一次可多則。保留帳號與日期即可。需 API Key 才會自動標註；也可直接載入示範資料。
+              </p>
+              <textarea
+                value={pasted}
+                onChange={(e) => setPasted(e.target.value)}
+                rows={10}
+                placeholder={"@unusual_whales 2026-09-10\nNVDA 近月買權出現異常大單…\n\n@zerohedge 2026-09-10\nAI capex 循環…"}
+                className="mt-3 w-full rounded border border-slate-700 bg-slate-950 p-3 font-mono text-sm text-slate-200 placeholder-slate-700 focus:outline-none focus:ring-2 focus:ring-sky-400"
+              />
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button onClick={ingestPasted} disabled={!!busy} className="rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50">
+                  讀取並歸類
+                </button>
+                <button onClick={loadDemo} className="rounded border border-slate-700 px-4 py-2 text-sm text-slate-400 hover:bg-slate-800">
+                  載入示範資料
+                </button>
+              </div>
+            </Modal>
+          )}
+
+          {/* 摘要 */}
+          {panel === "report" && (
+            <Modal title="共識摘要" onClose={() => setPanel(null)}>
+              <div className="flex flex-wrap items-center gap-2">
+                {REPORT_LANGS.map((l) => (
+                  <button
+                    key={l.id}
+                    onClick={() => setReportLang(l.id)}
+                    className={`rounded px-3 py-1.5 text-sm ${reportLang === l.id ? "bg-slate-700 text-slate-100" : "border border-slate-700 text-slate-400 hover:bg-slate-800"}`}
+                  >
+                    {l.label}
+                  </button>
+                ))}
+                <button
+                  onClick={makeReport}
+                  disabled={!!busy || matrix.length === 0}
+                  className="ml-auto rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                >
+                  產生摘要
+                </button>
+              </div>
+              {report ? (
+                <div className="mt-4">
+                  <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-200">{report}</p>
+                  <button
+                    onClick={() => navigator.clipboard?.writeText(report)}
+                    className="mt-3 rounded border border-slate-700 px-3 py-1.5 text-xs hover:bg-slate-800"
+                  >
+                    複製全文
+                  </button>
+                </div>
+              ) : (
+                <p className="mt-4 text-sm text-slate-600">
+                  摘要涵蓋共識最集中、分歧最大、以及立場轉向處。會依目前選擇的時間範圍（每日／每週／每月）產生。
+                </p>
+              )}
+            </Modal>
+          )}
+
+          {/* 設定 */}
+          {panel === "settings" && (
+            <Modal title="設定" onClose={() => setPanel(null)}>
+              <p className="text-sm text-slate-400">
+                若要使用自動標註、摘要、比對與 AI 問答，請貼上 Anthropic API Key（僅存本機瀏覽器）。
+              </p>
+              <input
+                type="password"
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                placeholder="sk-ant-..."
+                className="mt-3 w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-sky-400"
+              />
+              <div className="mt-3 flex gap-2">
+                <button onClick={saveApiKey} className="rounded bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-500">儲存</button>
+                <button
+                  onClick={() => { localStorage.removeItem("anthropic_api_key"); setApiKeyInput(""); }}
+                  className="rounded border border-slate-700 px-4 py-2 text-sm hover:bg-slate-800"
+                >
+                  清除
+                </button>
+              </div>
+              <p className="mt-4 text-xs text-slate-600">
+                沒有 API Key 也能完整使用示範資料與介面。所有立場與摘要僅供參考，不構成投資建議。
+              </p>
+            </Modal>
+          )}
+
+          <footer className="border-t border-slate-800 px-5 py-4 text-xs text-slate-600">
+            Alpha Consensus 只整理公開發言，不查證真偽、不代表實際持倉，也不構成投資建議。立場由模型自動判讀，關鍵決策前請回看原文。
+          </footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<ConsensusDashboard />);
+  </script>
+</body>
+</html>
